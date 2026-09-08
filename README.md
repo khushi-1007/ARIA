@@ -26,4 +26,196 @@ When someone is in danger, every second counts, but most safety apps stop at "se
 | 🛣️ **Safe Ride Mode** | Passive monitoring during commutes or rideshares |
  
 ---
+ ## 🧩 How It Works
  
+```
+ User in Danger
+       │
+       ▼
+ 1. SOS Triggered (manual / automatic)
+       │
+       ▼
+ 2. GPS Coordinates Captured
+       │
+       ▼
+ 3. Audio Evidence Recorded → sent to AI Engine
+       │
+       ▼
+ 4. AI Engine generates:
+       • Transcript
+       • Risk Score
+       • Threat Context
+       │
+       ▼
+ 5. Backend creates & stores Incident
+       │
+       ▼
+ 6. Incident emitted via Socket.IO (real-time)
+       │
+       ▼
+ 7. Police Dashboard receives live update
+       │
+       ▼
+ 8. PDF Incident Dossier generated for responders
+```
+ 
+---
+ 
+## 🏗️ System Architecture
+ 
+ARIA is built as four cooperating services:
+ 
+```
+┌──────────────────┐      ┌──────────────────┐      ┌──────────────────┐
+│   User App        │◄────►│   Backend API     │◄────►│   AI Engine        │
+│  (React + Vite)    │      │ (Node.js/Express)  │      │ (Python/FastAPI)    │
+└──────────────────┘      └──────────────────┘      └──────────────────┘
+                                    │
+                                    ▼
+                          ┌──────────────────┐
+                          │ Police Dashboard   │
+                          │  (React + Vite)     │
+                          └──────────────────┘
+                                    │
+                                    ▼
+                          ┌──────────────────┐
+                          │ Neon PostgreSQL     │
+                          └──────────────────┘
+```
+ 
+### 1. Frontend: User App
+- **Stack:** React, Vite, TypeScript, Socket.IO Client, Axios
+- **Screens:** Home Dashboard, Monitor, Safe Ride, Logs, Contacts, Profile
+- **Responsibilities:** authentication, SOS activation, live GPS, incident history, contacts & profile management
+- **Deployment:** Vercel
+### 2. Backend API Server
+- **Stack:** Node.js, Express.js, Socket.IO, PostgreSQL, JWT, Multer
+- **Responsibilities:** authentication, incident management, police-facing APIs, report generation, GPS streaming, real-time socket events
+- **Deployment:** Render
+### 3. AI Engine
+- **Stack:** Python, FastAPI, OpenAI Whisper, custom risk-scoring & context/tone analysis models
+- **Responsibilities:** audio transcription, threat detection, contextual risk scoring, incident intelligence generation
+- **Deployment:** Render
+### 4. Police Dispatch Dashboard
+- **Stack:** React, Vite, Socket.IO Client, Axios
+- **Responsibilities:** live incident monitoring, risk score visibility, GPS tracking, report generation, incident resolution
+- **Auth:** `X-Police-API-Key` header
+- **Deployment:** Vercel
+### Database
+- **Provider:** Neon PostgreSQL
+- **Core tables:** `users`, `incidents`, `reports`, plus supporting operational entities
+### Real-Time Layer
+- **Technology:** Socket.IO
+- **Purpose:** live incident creation, GPS updates, and instant dashboard synchronization between the user app, backend, and police dashboard
+---
+ 
+## 🔐 Security & Reliability
+ 
+- **JWT-based authentication** on all sensitive routes (profile, incident creation, report generation)
+- **API key authentication** for the police dispatch dashboard
+- **No hardcoded localhost URLs**, fully environment-aware via `BACKEND_URL` / `VITE_API_URL`
+- **No fake GPS data**: real coordinates only, with `0,0` as an explicit "unavailable" fallback (never a fabricated default location)
+- **HTTPS-compatible** geolocation handling with graceful error states
+---
+ 
+## ⚙️ Environment Variables
+ 
+**Backend**
+```
+DATABASE_URL
+JWT_SECRET
+AI_ENGINE_URL
+BACKEND_URL
+POLICE_API_KEY
+```
+ 
+**Frontend (User App)**
+```
+VITE_API_URL
+```
+ 
+**Police Dashboard**
+```
+VITE_API_URL
+VITE_SOCKET_URL
+VITE_POLICE_API_KEY
+```
+ 
+> ⚠️ Vite only exposes variables prefixed with `VITE_` to the client bundle.
+ 
+---
+ 
+## 🚀 Deployment
+ 
+| Component | Platform |
+|---|---|
+| User App | Vercel |
+| Police Dashboard | Vercel |
+| Backend API | Render |
+| AI Engine | Render |
+| Database | Neon PostgreSQL |
+ 
+**Live backend:** `https://aria-backend-2e96.onrender.com`
+
+ ## Live Demo
+ 
+### User Application
+https://aria-personal-safety.vercel.app/
+ 
+### Police Dashboard
+https://aria-personal-safety-z6uc.vercel.app/
+
+**Health checks:**
+```
+GET /health
+GET /api/health
+```
+ 
+---
+ 
+## 📄 Incident Dossier (PDF Reports)
+ 
+Every incident can generate a structured, police-ready PDF containing:
+- User information
+- Incident details & timestamps
+- GPS coordinates
+- AI-generated risk score
+- Full audio transcript
+- Links to evidence
+All generated links use the `BACKEND_URL` environment variable, with no localhost references shipped to production.
+ 
+---
+ 
+## 🛠️ Tech Stack Summary
+ 
+| Layer | Technologies |
+|---|---|
+| Frontend | React, Vite, TypeScript, Socket.IO Client, Axios |
+| Backend | Node.js, Express.js, Socket.IO, PostgreSQL, JWT, Multer |
+| AI Engine | Python, FastAPI, Whisper, custom risk/context/tone models |
+| Database | Neon PostgreSQL |
+| Hosting | Vercel (frontends), Render (backend & AI engine) |
+ 
+---
+ 
+## 🗺️ Roadmap
+ 
+- [ ] Wearable device integration for hands-free SOS
+- [ ] Multi-language support for AI transcription & analysis
+- [ ] Offline-first SOS queuing for low-connectivity areas
+- [ ] Trusted contact escalation chains
+- [ ] Expanded analytics for police dashboard (heatmaps, incident trends)
+---
+ 
+## 🤝 Why ARIA Matters
+ 
+Personal safety apps are common; real-time, AI-analyzed, responder-ready intelligence is not. ARIA isn't just an alarm button; it's a pipeline that turns a moment of crisis into structured, actionable information for the people who can actually help, delivered in seconds.
+ 
+---
+ 
+## 📬 Contact
+ 
+For questions, demos, or collaboration inquiries, please reach out via the repository's issues page or the contact details provided in our submission.
+
+
+
