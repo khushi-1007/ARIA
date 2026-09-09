@@ -296,3 +296,15 @@ button:focus-visible {
   background-size: 200% 200%;
   animation: gradient-shift 4s ease infinite;
 }
+
+/* ── Sleek Tactical Dark Map Tiles (Clean & Watermark-Free) ── */
+.leaflet-container .leaflet-tile-pane {
+  filter: invert(100%) hue-rotate(180deg) brightness(85%) contrast(90%);
+}
+
+@keyframes pulse-ring {
+  0% { transform: scale(0.9); opacity: 0.5; }
+  50% { transform: scale(1.2); opacity: 0.2; }
+  100% { transform: scale(0.9); opacity: 0.5; }
+}
+
