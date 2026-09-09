@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Shield, Bell, Phone, Star, AlertTriangle, AlertCircle, Trash, MapPin, User, Car, Check, Navigation, Play, Compass, History } from 'lucide-react';
+import { 
+  Shield, Bell, Phone, Star, AlertTriangle, AlertCircle, Trash, 
+  MapPin, User, Car, Check, Navigation, Play, Compass, History,
+  Locate, Loader2, Radio, Activity
+} from 'lucide-react';
 import { monitoringService } from '../services/api';
+import { connectSocket } from '../services/socket';
 import L from 'leaflet';
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from 'react-leaflet';
 
@@ -31,9 +36,85 @@ function RecenterMap({ coords }: { coords: { lat: number; lng: number } }) {
   useEffect(() => {
     if (coords) {
       map.setView([coords.lat, coords.lng], map.getZoom());
+      map.invalidateSize();
     }
   }, [coords, map]);
   return null;
+}
+
+// ── Real Geocoding with OpenStreetMap Nominatim ──────────────────────────────
+async function geocodeLocation(query: string): Promise<{ lat: number; lng: number; label: string } | null> {
+  if (!query || query.trim().length === 0) return null;
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`, {
+      headers: { 'Accept-Language': 'en' }
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data && data.length > 0) {
+      return {
+        lat: parseFloat(data[0].lat),
+        lng: parseFloat(data[0].lon),
+        label: data[0].display_name
+      };
+    }
+  } catch (err) {
+    console.warn('[SAFE_RIDE] Geocoding failed:', err);
+  }
+  return null;
+}
+
+// ── Reverse Geocoding with OpenStreetMap Nominatim ───────────────────────────
+async function reverseGeocode(lat: number, lng: number): Promise<string> {
+  try {
+    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}`, {
+      headers: { 'Accept-Language': 'en' }
+    });
+    if (!res.ok) return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+    const data = await res.json();
+    if (data && data.display_name) {
+      return data.display_name.split(',').slice(0, 3).join(',');
+    }
+  } catch (err) {
+    console.warn('[SAFE_RIDE] Reverse geocoding failed:', err);
+  }
+  return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+}
+
+// ── Real Road Network Route Fetcher via OSRM ──────────────────────────────────
+async function fetchRealRoadRoute(start: { lat: number; lng: number }, end: { lat: number; lng: number }) {
+  try {
+    const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
+      const r = data.routes[0];
+      const points = r.geometry.coordinates.map(([lon, lat]: [number, number]) => ({ lat, lng: lon }));
+      return {
+        points,
+        distanceKm: Math.round((r.distance / 1000) * 10) / 10,
+        durationMins: Math.max(1, Math.round(r.duration / 60))
+      };
+    }
+  } catch (err) {
+    console.warn('[SAFE_RIDE] OSRM road routing failed:', err);
+  }
+  return null;
+}
+
+// ── Fallback Smooth Path Generator ───────────────────────────────────────────
+function generateFallbackPath(start: { lat: number; lng: number }, end: { lat: number; lng: number }) {
+  const points = [];
+  const steps = 25;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const curve = Math.sin(t * Math.PI) * 0.003;
+    points.push({
+      lat: start.lat + (end.lat - start.lat) * t + curve,
+      lng: start.lng + (end.lng - start.lng) * t
+    });
+  }
+  return points;
 }
 
 interface SafeRideProps {
@@ -51,6 +132,15 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
   const [pickupLocation, setPickupLocation] = useState('');
   const [dropLocation, setDropLocation] = useState('');
   const [showSuspiciousModal, setShowSuspiciousModal] = useState(false);
+
+  // Dynamic Route & Geolocation state
+  const [isLoadingRoute, setIsLoadingRoute] = useState(false);
+  const [isLocatingUser, setIsLocatingUser] = useState(false);
+  const [trackingMode, setTrackingMode] = useState<'simulated' | 'live'>('simulated');
+  const [roadEtaMins, setRoadEtaMins] = useState<number | null>(null);
+  const [roadTotalKm, setRoadTotalKm] = useState<number | null>(null);
+  const watchIdRef = useRef<number | null>(null);
+  const activeSessionIdRef = useRef<string>('RIDE-' + Date.now());
 
   // History state
   const [showHistory, setShowHistory] = useState(false);
@@ -97,88 +187,110 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
     return R * 2 * Math.atan2(Math.sqrt(x), Math.sqrt(1 - x));
   }
 
-  // Generate a realistic grid-like route with turns
-  function generatePath(start: { lat: number; lng: number }, end: { lat: number; lng: number }) {
-    const points = [];
-    const stepsPerLeg = 8;
-    
-    // Create two intermediate corners to simulate street navigation
-    const mid1 = { lat: start.lat, lng: start.lng + (end.lng - start.lng) * 0.4 };
-    const mid2 = { lat: start.lat + (end.lat - start.lat) * 0.7, lng: mid1.lng };
-    
-    // Leg 1: start to mid1
-    for (let i = 0; i < stepsPerLeg; i++) {
-      const t = i / stepsPerLeg;
-      points.push({
-        lat: start.lat + (mid1.lat - start.lat) * t,
-        lng: start.lng + (mid1.lng - start.lng) * t,
-      });
+  // Handle GPS Auto-locate for Pickup
+  const handleLocateMe = () => {
+    if (!navigator.geolocation) {
+      alert('Geolocation is not supported by your device.');
+      return;
     }
-    
-    // Leg 2: mid1 to mid2
-    for (let i = 0; i < stepsPerLeg; i++) {
-      const t = i / stepsPerLeg;
-      points.push({
-        lat: mid1.lat + (mid2.lat - mid1.lat) * t,
-        lng: mid1.lng + (mid2.lng - mid1.lng) * t,
-      });
-    }
-    
-    // Leg 3: mid2 to end
-    for (let i = 0; i <= stepsPerLeg; i++) {
-      const t = i / stepsPerLeg;
-      points.push({
-        lat: mid2.lat + (end.lat - mid2.lat) * t,
-        lng: mid2.lng + (end.lng - mid2.lng) * t,
-      });
-    }
-    
-    return points;
-  }
+    setIsLocatingUser(true);
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        const address = await reverseGeocode(latitude, longitude);
+        setPickupLocation(address);
+        setIsLocatingUser(false);
+      },
+      (err) => {
+        console.warn('GPS error:', err);
+        setIsLocatingUser(false);
+        alert('Could not acquire your GPS position. Please type the location manually.');
+      },
+      { enableHighAccuracy: true, timeout: 8000 }
+    );
+  };
 
-  // Start the safe journey
-  const handleStartJourney = (e: React.FormEvent) => {
+  // Start the safe journey with Real Geocoding & Real Road Routing
+  const handleStartJourney = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!driverName || !carNumber || !carModel || !pickupLocation || !dropLocation) return;
 
-    // Reset alert flags
+    setIsLoadingRoute(true);
     setShowAlert(false);
 
-    // Get current GPS coordinates or use Kolkata fallback from screenshots
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          const start = { lat: pos.coords.latitude, lng: pos.coords.longitude };
-          initializeSimulation(start);
-        },
-        (err) => {
-          console.warn('[SAFE_RIDE] GPS unavailable, using fallback coordinates.');
-          initializeSimulation({ lat: 22.4823, lng: 88.2987 });
-        },
-        { enableHighAccuracy: true, timeout: 5000 }
-      );
+    // 1. Resolve Pickup Coordinates
+    let startCoords: { lat: number; lng: number } | null = null;
+    const geoPickup = await geocodeLocation(pickupLocation);
+    if (geoPickup) {
+      startCoords = { lat: geoPickup.lat, lng: geoPickup.lng };
+    } else if (navigator.geolocation) {
+      try {
+        const pos = await new Promise<GeolocationPosition>((resolve, reject) => {
+          navigator.geolocation.getCurrentPosition(resolve, reject, { timeout: 4000 });
+        });
+        startCoords = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+      } catch {
+        startCoords = { lat: 28.6139, lng: 77.2090 };
+      }
     } else {
-      initializeSimulation({ lat: 22.4823, lng: 88.2987 });
+      startCoords = { lat: 28.6139, lng: 77.2090 };
     }
-  };
 
-  const initializeSimulation = (start: { lat: number; lng: number }) => {
-    // Generate a destination about 2.5 km away
-    const end = { lat: start.lat + 0.014, lng: start.lng + 0.018 };
-    const path = generatePath(start, end);
+    // 2. Resolve Drop Destination Coordinates
+    let endCoords: { lat: number; lng: number } | null = null;
+    const geoDrop = await geocodeLocation(dropLocation);
+    if (geoDrop) {
+      endCoords = { lat: geoDrop.lat, lng: geoDrop.lng };
+    } else {
+      endCoords = { lat: startCoords.lat + 0.018, lng: startCoords.lng + 0.022 };
+    }
 
-    setGpsCoords(start);
-    setDestination(end);
-    setRouteWaypoints(path);
-    setSimulationPath(path);
+    // 3. Fetch Real Road Network Route via OSRM
+    const roadRoute = await fetchRealRoadRoute(startCoords, endCoords);
+    let finalPath: { lat: number; lng: number }[];
+    if (roadRoute && roadRoute.points.length > 1) {
+      finalPath = roadRoute.points;
+      setRoadEtaMins(roadRoute.durationMins);
+      setRoadTotalKm(roadRoute.distanceKm);
+    } else {
+      finalPath = generateFallbackPath(startCoords, endCoords);
+      const dist = haversineDistance(startCoords, endCoords);
+      setRoadTotalKm(Math.round(dist * 10) / 10);
+      setRoadEtaMins(Math.max(1, Math.round(dist * 3)));
+    }
+
+    activeSessionIdRef.current = 'RIDE-' + Date.now();
+    setGpsCoords(startCoords);
+    setDestination(endCoords);
+    setRouteWaypoints(finalPath);
+    setSimulationPath(finalPath);
     setCurrentPathIndex(0);
     setHasReachedDestination(false);
+    setIsLoadingRoute(false);
     setRideState('active');
+
+    // Broadcast journey start to Socket.IO for police dashboard live telemetry
+    try {
+      const socket = connectSocket();
+      socket.emit('locationUpdate', {
+        incidentId: activeSessionIdRef.current,
+        latitude: startCoords.lat,
+        longitude: startCoords.lng,
+        riskScore: 12,
+        userName: `Safe Ride: ${driverName} (${carNumber})`,
+        triggerType: 'safe_ride_transit',
+        driverName,
+        carModel,
+        carNumber
+      });
+    } catch (err) {
+      console.warn('[SAFE_RIDE] Socket emit error:', err);
+    }
   };
 
   // Run the animated coordinate simulation
   useEffect(() => {
-    if (rideState !== 'active' || simulationPath.length === 0) return;
+    if (rideState !== 'active' || simulationPath.length === 0 || trackingMode === 'live') return;
 
     simulationIntervalRef.current = window.setInterval(() => {
       setCurrentPathIndex((prevIndex) => {
@@ -188,6 +300,24 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
           const currentPoint = simulationPath[nextIndex];
           setGpsCoords(currentPoint);
 
+          // Stream live telemetry to backend Socket.IO for Police Dashboard
+          try {
+            const socket = connectSocket();
+            socket.emit('locationUpdate', {
+              incidentId: activeSessionIdRef.current,
+              latitude: currentPoint.lat,
+              longitude: currentPoint.lng,
+              riskScore: showAlert ? 78 : 12,
+              userName: `Safe Ride: ${driverName} (${carNumber})`,
+              triggerType: showAlert ? 'route_deviation' : 'safe_ride_transit',
+              driverName,
+              carModel,
+              carNumber
+            });
+          } catch (err) {
+            console.warn('[SAFE_RIDE] Socket telemetry error:', err);
+          }
+
           // Simulate unplanned route deviation at 60% of the journey
           if (nextIndex === Math.floor(simulationPath.length * 0.6)) {
             setShowAlert(true);
@@ -196,7 +326,7 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
 
           return nextIndex;
         } else {
-          // Reached destination but don't automatically end
+          // Reached destination
           if (simulationIntervalRef.current) {
             clearInterval(simulationIntervalRef.current);
           }
@@ -211,7 +341,52 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
         clearInterval(simulationIntervalRef.current);
       }
     };
-  }, [rideState, simulationPath]);
+  }, [rideState, simulationPath, trackingMode, showAlert, driverName, carNumber, carModel]);
+
+  // Real device GPS tracking mode
+  useEffect(() => {
+    if (rideState !== 'active' || trackingMode !== 'live') {
+      if (watchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+      return;
+    }
+
+    if (navigator.geolocation) {
+      watchIdRef.current = navigator.geolocation.watchPosition(
+        (pos) => {
+          const livePoint = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+          setGpsCoords(livePoint);
+          try {
+            const socket = connectSocket();
+            socket.emit('locationUpdate', {
+              incidentId: activeSessionIdRef.current,
+              latitude: livePoint.lat,
+              longitude: livePoint.lng,
+              riskScore: showAlert ? 78 : 12,
+              userName: `Safe Ride: ${driverName} (${carNumber})`,
+              triggerType: showAlert ? 'route_deviation' : 'safe_ride_live_gps',
+              driverName,
+              carModel,
+              carNumber
+            });
+          } catch (err) {
+            console.warn('[SAFE_RIDE] Live GPS emit error:', err);
+          }
+        },
+        (err) => console.warn('Watch GPS error:', err),
+        { enableHighAccuracy: true, maximumAge: 1000 }
+      );
+    }
+
+    return () => {
+      if (watchIdRef.current !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+        watchIdRef.current = null;
+      }
+    };
+  }, [rideState, trackingMode, showAlert, driverName, carNumber, carModel]);
 
   // Trigger backend monitoring session on deviation
   const triggerDeviationMonitoring = async () => {
@@ -243,6 +418,10 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
     if (simulationIntervalRef.current) {
       clearInterval(simulationIntervalRef.current);
     }
+    if (watchIdRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
     setRideState('arrived');
   };
 
@@ -264,6 +443,10 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
     if (simulationIntervalRef.current) {
       clearInterval(simulationIntervalRef.current);
     }
+    if (watchIdRef.current !== null && navigator.geolocation) {
+      navigator.geolocation.clearWatch(watchIdRef.current);
+      watchIdRef.current = null;
+    }
     setRideState('setup');
     setGpsCoords(null);
     setDestination(null);
@@ -276,7 +459,9 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
 
   // Calculations for active trip
   const distanceRemaining = gpsCoords && destination ? haversineDistance(gpsCoords, destination) : 0;
-  const estimatedEta = Math.max(1, Math.round(distanceRemaining * 5));
+  const estimatedEta = roadEtaMins 
+    ? (hasReachedDestination ? 0 : Math.max(1, Math.round(roadEtaMins * (simulationPath.length > 0 ? (simulationPath.length - currentPathIndex) / simulationPath.length : 1))))
+    : Math.max(1, Math.round(distanceRemaining * 5));
 
   return (
     <div className="pt-20 pb-36 px-6 font-sans select-none animate-fade-in-scale">
@@ -463,15 +648,30 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
 
                 {/* Pickup Location */}
                 <div className="space-y-1.5 group">
-                  <label className="text-[9px] font-bold text-on-surface-variant/80 ml-1 tracking-widest uppercase">
-                    Pickup Location
-                  </label>
+                  <div className="flex justify-between items-center ml-1">
+                    <label className="text-[9px] font-bold text-on-surface-variant/80 tracking-widest uppercase">
+                      Pickup Location
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handleLocateMe}
+                      disabled={isLocatingUser}
+                      className="text-[9px] font-bold text-secondary hover:text-white flex items-center gap-1 cursor-pointer transition-colors"
+                    >
+                      {isLocatingUser ? (
+                        <Loader2 className="w-2.5 h-2.5 animate-spin" />
+                      ) : (
+                        <Locate className="w-2.5 h-2.5" />
+                      )}
+                      <span>{isLocatingUser ? "Locating..." : "Use Current GPS"}</span>
+                    </button>
+                  </div>
                   <div className="relative rounded-xl border border-outline-variant bg-surface-container-lowest focus-within:border-primary/50 focus-within:ring-2 focus-within:ring-primary/10 focus-within:shadow-[0_0_12px_rgba(255,180,172,0.1)] transition-all duration-200">
                     <MapPin className="w-4 h-4 absolute left-4 top-1/2 -translate-y-1/2 text-secondary/70 group-focus-within:text-secondary transition-colors" />
                     <input
                       type="text"
                       className="w-full h-11 bg-transparent text-on-surface pl-11 pr-4 rounded-xl focus:ring-0 focus:outline-none text-sm placeholder:text-on-surface-variant/40"
-                      placeholder="Enter pickup point"
+                      placeholder="e.g. Connaught Place, Delhi"
                       value={pickupLocation}
                       onChange={(e) => setPickupLocation(e.target.value)}
                       required
@@ -489,7 +689,7 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
                     <input
                       type="text"
                       className="w-full h-11 bg-transparent text-on-surface pl-11 pr-4 rounded-xl focus:ring-0 focus:outline-none text-sm placeholder:text-on-surface-variant/40"
-                      placeholder="Enter drop destination"
+                      placeholder="e.g. India Gate, Delhi"
                       value={dropLocation}
                       onChange={(e) => setDropLocation(e.target.value)}
                       required
@@ -499,10 +699,20 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
 
                 <button
                   type="submit"
-                  className="w-full h-12.5 bg-gradient-to-r from-secondary-container via-secondary to-secondary-container text-white font-black text-xs uppercase tracking-widest rounded-xl hover:shadow-[0_0_16px_rgba(51,148,241,0.3)] shadow-[0_4px_16px_rgba(51,148,241,0.15)] active:scale-[0.98] transition-all flex items-center justify-center gap-2 mt-6 cursor-pointer shimmer animate-gradient-shift"
+                  disabled={isLoadingRoute}
+                  className="w-full h-12.5 bg-gradient-to-r from-secondary-container via-secondary to-secondary-container text-white font-black text-xs uppercase tracking-widest rounded-xl hover:shadow-[0_0_16px_rgba(51,148,241,0.3)] shadow-[0_4px_16px_rgba(51,148,241,0.15)] active:scale-[0.98] transition-all flex items-center justify-center gap-2 mt-6 cursor-pointer shimmer animate-gradient-shift disabled:opacity-60"
                 >
-                  <span>Start Safe Journey</span>
-                  <Play className="w-3.5 h-3.5 fill-white" />
+                  {isLoadingRoute ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Calculating Safe Road Route...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Start Safe Journey</span>
+                      <Play className="w-3.5 h-3.5 fill-white" />
+                    </>
+                  )}
                 </button>
               </form>
             </div>
@@ -545,7 +755,7 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
                     zoomControl={false}
                   >
                     <TileLayer
-                      url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
+                      url="https://tile.openstreetmap.org/{z}/{x}/{y}.png"
                       attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
                     />
                     <Marker position={[gpsCoords.lat, gpsCoords.lng]} icon={userIcon} />
@@ -571,8 +781,35 @@ export default function SafeRideView({ onTriggerSOS }: SafeRideProps) {
                 <div className="absolute top-4 left-4 glass-card px-3.5 py-1.5 rounded-full flex items-center gap-2 border-white/10" style={{ zIndex: 1000 }}>
                   <span className={`w-2 h-2 rounded-full ${hasReachedDestination ? 'bg-secondary animate-pulse shadow-[0_0_8px_rgba(162,201,255,0.8)]' : showAlert ? 'bg-primary animate-ping shadow-[0_0_8px_rgba(255,84,76,0.8)]' : 'bg-tertiary animate-pulse shadow-[0_0_8px_rgba(114,212,239,0.8)]'}`} />
                   <span className="text-[9px] font-black text-white uppercase tracking-widest font-sans">
-                    {hasReachedDestination ? 'Destination Reached' : showAlert ? 'Route Deviation detected' : 'Tracking Active'}
+                    {hasReachedDestination ? 'Destination Reached' : showAlert ? 'Route Deviation detected' : trackingMode === 'live' ? 'Live GPS Active' : 'Road Route Active'}
                   </span>
+                </div>
+
+                {/* Floating Tracking Mode & Deviation Controls */}
+                <div className="absolute top-4 right-4 flex items-center gap-1.5" style={{ zIndex: 1000 }}>
+                  <button
+                    type="button"
+                    onClick={() => setTrackingMode(prev => prev === 'simulated' ? 'live' : 'simulated')}
+                    className="glass-card px-2.5 py-1 rounded-full text-[9px] font-bold text-secondary border-white/10 hover:bg-white/10 transition-all flex items-center gap-1 cursor-pointer shadow-sm"
+                    title="Toggle between Simulated Road Transit and Live Device GPS"
+                  >
+                    <Radio className="w-2.5 h-2.5 text-secondary" />
+                    <span>{trackingMode === 'live' ? 'Mode: Live GPS' : 'Mode: Road Sim'}</span>
+                  </button>
+                  {!showAlert && !hasReachedDestination && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowAlert(true);
+                        triggerDeviationMonitoring();
+                      }}
+                      className="glass-card px-2.5 py-1 rounded-full text-[9px] font-bold text-primary border-primary/20 hover:bg-primary/10 transition-all flex items-center gap-1 cursor-pointer shadow-sm"
+                      title="Test anomaly detection"
+                    >
+                      <AlertTriangle className="w-2.5 h-2.5 text-primary" />
+                      <span>Test Deviation</span>
+                    </button>
+                  )}
                 </div>
 
                 {/* Live GPS coordinates */}
